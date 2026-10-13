@@ -1481,6 +1481,8 @@ async def stream_upstream(
     emitted_response_created = False
     response_text = ""
     response_text_started = False
+    # 协议结束事件（response.completed / message_stop）是否已下发，防止重复收尾
+    finish_emitted = False
     chunk_count = 0
     done_seen = False
     upstream_response_id: str | None = None
@@ -1685,15 +1687,22 @@ async def stream_upstream(
                         for event_name, event_data in events:
                             yield f"event: {event_name}\ndata: {json.dumps(event_data, ensure_ascii=False)}\n\n".encode()
                 
-                # 发送结束事件
+                # 发送结束事件。finish_emitted 保证整个流只结束一次：
+                # 正常路径结束后若 aclose()/尾部读取再抛 TransportError，
+                # 下面的恢复分支不会重复补发 completed（ResponsesStreamConverter
+                # .finish() 自身不是幂等的）。
                 if protocol == "responses" and responses_state:
-                    for event_name, event_data in responses_state.finish():
-                        yield f"event: {event_name}\ndata: {json.dumps(event_data, ensure_ascii=False)}\n\n".encode()
-                
+                    if not finish_emitted:
+                        finish_emitted = True
+                        for event_name, event_data in responses_state.finish():
+                            yield f"event: {event_name}\ndata: {json.dumps(event_data, ensure_ascii=False)}\n\n".encode()
+
                 elif protocol == "anthropic" and anthropic_state:
-                    for event_name, event_data in anthropic_state.finish():
-                        yield f"event: {event_name}\ndata: {json.dumps(event_data, ensure_ascii=False)}\n\n".encode()
-                
+                    if not finish_emitted:
+                        finish_emitted = True
+                        for event_name, event_data in anthropic_state.finish():
+                            yield f"event: {event_name}\ndata: {json.dumps(event_data, ensure_ascii=False)}\n\n".encode()
+
                 elif protocol == "openai":
                     yield b"data: [DONE]\n\n"
 
@@ -1727,18 +1736,20 @@ async def stream_upstream(
             elapsed=round(time.time() - stream_start_time, 2))
         state.write_log("stream_transport_error", protocol=protocol, chunks=chunk_count,
             exc_type=type(exc).__name__, error=str(exc), done_seen=done_seen)
-        if protocol == "responses" and responses_state:
+        if protocol == "responses" and responses_state and not finish_emitted:
             # 已在处理中（收到过文本或已 started）：把已累积内容作为完整响应收尾。
             # 中途断裂时文本是截断的，但比直接 422 更可用，且客户端不会中断。
             if done_seen or getattr(responses_state, "started", False) or responses_state.text:
+                finish_emitted = True
                 try:
                     for event_name, event_data in responses_state.finish():
                         yield f"event: {event_name}\ndata: {json.dumps(event_data, ensure_ascii=False)}\n\n".encode()
                 except Exception as fin_exc:
                     diagnostic("finish_reemit_error", protocol=protocol, error=str(fin_exc))
                 return
-        elif protocol == "anthropic" and anthropic_state:
+        elif protocol == "anthropic" and anthropic_state and not finish_emitted:
             if done_seen or getattr(anthropic_state, "text", ""):
+                finish_emitted = True
                 try:
                     for event_name, event_data in anthropic_state.finish():
                         yield f"event: {event_name}\ndata: {json.dumps(event_data, ensure_ascii=False)}\n\n".encode()
